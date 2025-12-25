@@ -1,56 +1,35 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use chrono::{DateTime, Utc};
-use csv::StringRecord;
 use std::io::{self, Write};
-use std::path::Path;
+use std::fs::File;
 
 mod market;
 mod collectors;
+mod fetcher; 
 
-use market::{MinuteBar, resample_1h_regular_session};
-use collectors::{NewsCollector, SenateCollector, FinanceSnapshotCollector};
-use collectors::{NullNewsCollector, NullSenateCollector, StubFinanceSnapshotCollector};
+use market::resample_1h_regular_session;
+use collectors::{NewsCollector, InsiderCollector, FinanceSnapshotCollector}; 
+use collectors::{GoogleNewsCollector, YahooInsiderCollector, YahooSnapshotCollector}; 
 
 #[derive(Parser)]
 struct Args {
-    /// Ticker symbol (e.g., AAPL)
     #[arg(long)]
     ticker: Option<String>,
 
-    /// Path to the CSV file containing minute bars
-    #[arg(long("source-path"))]
-    source_path: Option<String>,
-
-    /// Number of trading days to include
     #[arg(long, default_value = "7")]
     window_days: i64,
 
-    /// Disable news section
     #[arg(long)]
     no_news: bool,
 
-    /// Disable senate activity section
     #[arg(long)]
-    no_senate: bool,
+    no_senate: bool, 
 
-    /// Disable finance snapshot section
     #[arg(long)]
     no_finance: bool,
-}
-
-fn parse_row(rec: &StringRecord) -> Result<MinuteBar> {
-    // Expected: ts, o, h, l, c, v
-    let ts_str = rec.get(0).context("missing ts")?;
-    let ts: DateTime<Utc> = ts_str.parse().context("bad ts format")?;
     
-    let o: f64 = rec.get(1).context("missing o")?.parse().context("bad o")?;
-    let h: f64 = rec.get(2).context("missing h")?.parse().context("bad h")?;
-    let l: f64 = rec.get(3).context("missing l")?.parse().context("bad l")?;
-    let c: f64 = rec.get(4).context("missing c")?.parse().context("bad c")?;
-    let v: u64 = rec.get(5).context("missing v")?.parse().context("bad v")?;
-    
-    Ok(MinuteBar { ts_utc: ts, o, h, l, c, v })
+    #[arg(long)]
+    output: Option<String>,
 }
 
 fn prompt_input(prompt: &str) -> Result<String> {
@@ -62,10 +41,11 @@ fn prompt_input(prompt: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args_cli = Args::parse();
+    let is_interactive = args_cli.ticker.is_none();
     
     // Interactive Mode Logic
-    let ticker = match args.ticker {
+    let ticker = match args_cli.ticker {
         Some(t) => t.to_uppercase(),
         None => {
             let t = prompt_input("Enter Ticker (e.g. AMZN): ")?;
@@ -76,149 +56,143 @@ fn main() -> Result<()> {
         }
     };
 
-    let source_path = match args.source_path {
-        Some(p) => p,
-        None => {
-            // Check default locations
-            let default_name = format!("{}.csv", ticker);
-            let candidates = vec![
-                default_name.clone(),
-                format!("data/{}", default_name),
-                format!("sample_data/{}", default_name),
-            ];
-            
-            let found = candidates.iter().find(|p| Path::new(p).exists());
-            
-            if let Some(p) = found {
-                println!("Found data at: {}", p);
-                p.clone()
-            } else {
-                let p = prompt_input(&format!("Enter path to CSV for {} [default: ./{}]: ", ticker, default_name))?;
-                if p.is_empty() {
-                    default_name
+    if is_interactive {
+        eprintln!("Fetching data for {} from the internet...", ticker);
+        eprintln!("(This may take a few seconds to scrape news bodies and insider info)");
+    }
+
+    let (rows, meta) = fetcher::fetch_minute_bars(&ticker, args_cli.window_days)
+        .with_context(|| format!("Failed to fetch price data for {}", ticker))?;
+    
+    let chart = resample_1h_regular_session(&ticker, &rows, args_cli.window_days);
+
+    // 3. Collect Extra Data (Live!)
+    let news_block = if !args_cli.no_news {
+        let col = GoogleNewsCollector;
+        match col.collect_news(&ticker, args_cli.window_days) {
+            Ok(items) => {
+                if items.is_empty() {
+                    "No recent news found.".to_string()
                 } else {
-                    p
+                     items.iter().take(10).map(|item| {
+                         format!("{} | {} | {}\n{}\n-------------------", 
+                            item.datetime, item.source, item.headline, item.content_snippet)
+                     }).collect::<Vec<_>>().join("\n")
                 }
             }
-        }
-    };
-
-    // 1. Load Price Data
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .from_path(&source_path)
-        .with_context(|| format!("failed to open csv {}", source_path))?;
-
-    let mut rows: Vec<MinuteBar> = Vec::with_capacity(50_000);
-    for r in rdr.records() {
-        let rec = r?;
-        rows.push(parse_row(&rec)?);
-    }
-    // Sort logic just in case CSV isn't perfectly sorted
-    rows.sort_by_key(|b| b.ts_utc);
-
-    // 2. Resample
-    let chart = resample_1h_regular_session(&ticker, &rows, args.window_days);
-
-    // 3. Collect Extra Data (Stubs)
-    let news_lines = if !args.no_news {
-        let col = NullNewsCollector;
-        let items = col.collect_news(&ticker, args.window_days)?;
-        if items.is_empty() {
-            String::new()
-        } else {
-             items.iter().map(|item| {
-                 format!("{} | {} | {} | {}", item.datetime, item.source, item.headline, item.url)
-             }).collect::<Vec<_>>().join("\n")
+            Err(e) => format!("Error fetching news: {}", e)
         }
     } else {
         String::new()
     };
 
-    let senate_lines = if !args.no_senate {
-        let col = NullSenateCollector;
-        let items = col.collect_senate_activity(&ticker, args.window_days)?;
-         if items.is_empty() {
-            String::new()
-        } else {
-             items.iter().map(|item| {
-                 format!("{} | {} | {} | {} | {}", item.date, item.chamber, item.member_name, item.activity_type, item.notes.as_deref().unwrap_or(""))
-             }).collect::<Vec<_>>().join("\n")
+    let insider_block = if !args_cli.no_senate { 
+        let col = YahooInsiderCollector;
+        // Pass the window_days for strict filtering!
+        match col.collect_activity(&ticker, args_cli.window_days) {
+            Ok((trades, holders)) => {
+                let mut s = String::new();
+                if trades.is_empty() {
+                    s.push_str(&format!("--- RECENT INSIDER TRANSACTIONS (Last {} Days) ---\n", args_cli.window_days));
+                    s.push_str("No transactions found in this period.\n");
+                } else {
+                    s.push_str(&format!("--- RECENT INSIDER TRANSACTIONS (Last {} Days) ---\n", args_cli.window_days));
+                    s.push_str("# Date | Entity | Relation | Type | Value\n");
+                    for t in trades {
+                        s.push_str(&format!("{} | {} | {} | {} | {}\n", t.date, t.entity_name, t.relation, t.transaction_type, t.value_approx));
+                    }
+                }
+                
+                s.push_str("\n--- TOP INSTITUTIONAL & FUND HOLDERS ---\n");
+                s.push_str("# Holder | % Held\n");
+                for h in holders {
+                     s.push_str(&format!("{} | {}\n", h.holder_name, h.pct_held));
+                }
+                s
+            },
+            Err(e) => format!("Error fetching insider info: {}", e)
         }
     } else {
         String::new()
     };
 
-    let finance_block = if !args.no_finance {
-        let col = StubFinanceSnapshotCollector;
-        let snap = col.collect_snapshot(&ticker)?;
-        if let Some(s) = snap {
-            format!(
-                "source: {}\nasof_utc: {}\nprice_last: {}\nmarket_cap_approx: {}\npe_ratio_approx: {}\nnotes: \"{}\"\n",
-                s.source, s.asof_utc, s.price_last, 
-                s.market_cap_approx.map(|v| v.to_string()).unwrap_or_default(),
-                s.pe_ratio_approx.map(|v| v.to_string()).unwrap_or_default(),
-                s.notes
-            )
-        } else {
-             String::new()
+    let finance_block = if !args_cli.no_finance {
+        let col = YahooSnapshotCollector;
+        match col.collect_snapshot(&ticker, meta.as_ref()) {
+            Ok(Some(s)) => {
+                format!(
+                    "source: {}\nasof_utc: {}\nprice_last: {}\nnotes: \"{}\"\n",
+                    s.source, s.asof_utc, s.price_last, s.notes
+                )
+            },
+            Ok(None) => "No snapshot available.".to_string(),
+            Err(e) => format!("Error fetching snapshot: {}", e)
         }
     } else {
         String::new()
     };
 
 
-    // 4. Output Packet
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
+    // 4. Build Packet String
+    let mut packet = String::new();
+    packet.push_str("<<<TICKER_PACKET_V1>>>\n");
+    packet.push_str(&format!("TICKER: {}\n", ticker));
+    packet.push_str("TZ: America/New_York\n");
+    packet.push_str("SESSION: REGULAR (09:30-16:00)\n");
+    packet.push_str(&format!("WINDOW_DAYS: {}\n", args_cli.window_days));
+    packet.push_str("BAR_SIZE: 1h\n");
+    packet.push_str(&format!("BARS_COUNT: {}\n", chart.bars.len()));
+    packet.push_str("\n");
 
-    writeln!(handle, "<<<TICKER_PACKET_V1>>>")?;
-    writeln!(handle, "TICKER: {}", ticker)?;
-    writeln!(handle, "TZ: America/New_York")?;
-    writeln!(handle, "SESSION: REGULAR (09:30-16:00)")?;
-    writeln!(handle, "WINDOW_DAYS: {}", args.window_days)?;
-    writeln!(handle, "BAR_SIZE: 1h")?;
-    writeln!(handle, "BARS_COUNT: {}", chart.bars.len())?;
-    writeln!(handle)?;
-
-    writeln!(handle, "<<<PRICE_BARS_1H_CSV>>>")?;
-    writeln!(handle, "# ts_local,o,h,l,c,v")?;
+    packet.push_str("<<<PRICE_BARS_1H_CSV>>>\n");
+    packet.push_str("# ts_local,o,h,l,c,v\n");
     for b in &chart.bars {
-        writeln!(handle, "{},{:.6},{:.6},{:.6},{:.6},{}", b.ts_local, b.o, b.h, b.l, b.c, b.v)?;
+        packet.push_str(&format!("{},{:.6},{:.6},{:.6},{:.6},{}\n", b.ts_local, b.o, b.h, b.l, b.c, b.v));
     }
-    writeln!(handle, "<<<END_PRICE_BARS_1H_CSV>>>")?;
-    writeln!(handle)?;
+    packet.push_str("<<<END_PRICE_BARS_1H_CSV>>>\n");
+    packet.push_str("\n");
 
-    writeln!(handle, "<<<NEWS_TOP10_1W>>>")?;
-    writeln!(handle, "# Each line: datetime | source | headline | url")?;
-    if !news_lines.is_empty() {
-        writeln!(handle, "{}", news_lines)?;
+    packet.push_str("<<<NEWS_TOP10_BODY>>>\n");
+    if !news_block.is_empty() {
+        packet.push_str(&news_block);
+        packet.push_str("\n");
     }
-    writeln!(handle, "<<<END_NEWS_TOP10_1W>>>")?;
-    writeln!(handle)?;
+    packet.push_str("<<<END_NEWS_TOP10_BODY>>>\n");
+    packet.push_str("\n");
 
-    writeln!(handle, "<<<SENATE_ACTIVITY>>>")?;
-    writeln!(handle, "# Each line: date | chamber | member_name | activity_type | notes")?;
-     if !senate_lines.is_empty() {
-        writeln!(handle, "{}", senate_lines)?;
+    packet.push_str("<<<INSIDER_AND_INSTITUTIONAL_ACTIVITY>>>\n");
+     if !insider_block.is_empty() {
+        packet.push_str(&insider_block);
+        packet.push_str("\n");
     }
-    writeln!(handle, "<<<END_SENATE_ACTIVITY>>>")?;
-    writeln!(handle)?;
+    packet.push_str("<<<END_INSIDER_AND_INSTITUTIONAL_ACTIVITY>>>\n");
+    packet.push_str("\n");
 
-    writeln!(handle, "<<<FINANCE_SNAPSHOT>>>")?;
+    packet.push_str("<<<FINANCE_SNAPSHOT>>>\n");
     if !finance_block.is_empty() {
-        write!(handle, "{}", finance_block)?;
+        packet.push_str(&finance_block);
     }
-    writeln!(handle, "<<<END_FINANCE_SNAPSHOT>>>")?;
-    writeln!(handle)?;
+    packet.push_str("<<<END_FINANCE_SNAPSHOT>>>\n");
+    packet.push_str("\n");
 
-    writeln!(handle, "<<<NOTES>>>")?;
-    writeln!(handle, "- This packet is plain text designed for a 3B LLM and downstream ML models.")?;
-    writeln!(handle, "- Parsing is simplified by strong delimiters (<<<...>>>).")?;
-    writeln!(handle, "- Bars are for regular US trading sessions only; final bar per day may be shorter.")?;
-    writeln!(handle, "- Data quality / licensing for intraday prices and news is handled separately upstream.")?;
-    writeln!(handle, "<<<END_NOTES>>>")?;
-    writeln!(handle, "<<<END_TICKER_PACKET_V1>>>")?;
+    // 5. Output Handling
+    print!("{}", packet);
+
+    let output_file = if let Some(path) = args_cli.output {
+        Some(path)
+    } else if is_interactive {
+        Some(format!("{}_packet.txt", ticker))
+    } else {
+        None
+    };
+
+    if let Some(path) = output_file {
+        let mut f = File::create(&path).with_context(|| format!("failed to create output file {}", path))?;
+        f.write_all(packet.as_bytes())?;
+        if is_interactive {
+            eprintln!("Packet saved to: {}", path);
+        }
+    }
 
     Ok(())
 }
