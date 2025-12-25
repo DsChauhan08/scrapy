@@ -1,6 +1,6 @@
-# WeekChart: Financial Data Packetizer for LLMs
+# Scrapy: Financial Data Packetizer for LLMs
 
-**WeekChart** is a high-performance command-line tool written in Rust designed to fetch, aggregate, and "packetize" real-time financial data into a clean, context-rich text format optimized for Large Language Models (LLMs) and AI Agents.
+**Scrapy** is a high-performance command-line tool written in Rust designed to fetch, aggregate, and "packetize" real-time financial data into a clean, context-rich text format optimized for Large Language Models (LLMs) and AI Agents.
 
 Stop parsing messy JSON or scraping generic HTML. WeekChart gives you a single, dense, semantic block of text containing price history, news, and insider activity, ready to be pasted into a prompt or ingested by an agent.
 
